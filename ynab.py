@@ -68,12 +68,21 @@ def get_budget(auth, budget=None):
 # Unlike the other YNAB fetchers, this returns the raw JSON instead of the
 # converted namedtuples. Should we change this to do the same? Make this a
 # generator?
-def get_transactions(auth, budget_id, since=None):
-    if since:
-        logging.info(f'Only fetching transactions since {since}.')
-        response = requests.get(f'{API}/{budget_id}/transactions?since_date={since}', headers=auth)
+def get_transactions(auth, budget_id, since=None, account_id=None):
+    if account_id:
+        if since:
+            logging.info(f'Only fetching transactions for account_id {account_id}.')
+            logging.info(f'Only fetching transactions since {since}.')
+            response = requests.get(f'{API}/{budget_id}/accounts/{account_id}/transactions?since_date={since}', headers=auth)
+        else:
+            logging.info(f'Only fetching transactions for account_id {account_id}.')
+            response = requests.get(f'{API}/{budget_id}/accounts/{account_id}/transactions', headers=auth)
     else:
-        response = requests.get(f'{API}/{budget_id}/transactions', headers=auth)
+        if since:
+            logging.info(f'Only fetching transactions since {since}.')
+            response = requests.get(f'{API}/{budget_id}/transactions?since_date={since}', headers=auth)
+        else:
+            response = requests.get(f'{API}/{budget_id}/transactions', headers=auth)
     response.raise_for_status()
     transactions = response.json()
 #    with open('txn.json', 'w+') as f:
@@ -167,7 +176,7 @@ def get_target_account(txn, adjustment_account):
         # a valid beancount entry, so we generate an error mesage.
         return '; FIXME. Error could only generate one leg from YNAB data.'
 
-def get_ynab_data(token, budget_name, since):
+def get_ynab_data(token, budget_name, since, account_id):
     logging.info('Using regular fetcher for YNAB.')
     # BENCHMARK: benchmark vanilla vs. async
     start_timing = time.time()
@@ -185,7 +194,7 @@ def get_ynab_data(token, budget_name, since):
     ynab_category_groups, ynab_categories = get_ynab_categories(auth_header, budget.id)
 
     logging.info('Fetching YNAB transactions.')
-    ynab_transactions = get_transactions(auth_header, budget.id, since=since)
+    ynab_transactions = get_transactions(auth_header, budget.id, since=since, account_id=account_id)
 
     # BENCHMARK: benchmark vanilla vs. async
     end_timing = time.time()
@@ -193,7 +202,7 @@ def get_ynab_data(token, budget_name, since):
 
     return budget, ynab_accounts, ynab_category_groups, ynab_categories, ynab_transactions
 
-def get_ynab_data_async(token, budget_name, since):
+def get_ynab_data_async(token, budget_name, since, account_id):
     logging.info('Using asynchronous fetcher for YNAB.')
     start_timing = time.time()
 
@@ -221,12 +230,21 @@ def get_ynab_data_async(token, budget_name, since):
 
                 task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/categories', session))
                 tasks.append(task)
-
-                if since:
-                    logging.info(f'Only fetching transactions since {since}.')
-                    task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/transactions?since_date={since}', session))
+                
+                if account_id:
+                    if since:
+                        logging.info(f'Only fetching transactions for account_id {account_id}.')
+                        logging.info(f'Only fetching transactions since {since}.')
+                        task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/accounts/{account_id}/transactions?since_date={since}', session))
+                    else:
+                        logging.info(f'Only fetching transactions for account_id {account_id}.')
+                        task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/accounts/{account_id}/transactions', session))
                 else:
-                    task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/transactions', session))
+                    if since:
+                        logging.info(f'Only fetching transactions since {since}.')
+                        task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/transactions?since_date={since}', session))
+                    else:
+                        task = asyncio.ensure_future(fetch(f'{API}/{budget.id}/transactions', session))
                 tasks.append(task)
 
             responses = await asyncio.gather(*tasks)
@@ -273,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', action='store_true', default=False, help='Mildly verbose logging to stderr.')
     parser.add_argument('--enable-async-fetch', '--disable-async-fetch', dest='async_fetch', action=NegateAction, default=(aiohttp is not None), nargs=0, help='Use aiohttp to fetch YNAB data in parallel.')
     parser.add_argument('--balance-adjustment-account', help='Account to assign all automatically entered reconciliation balance adjustments.')
+    parser.add_argument('--account_id', help='Get transactions for only the specified account')
     args = parser.parse_args()
     if args.since:
        args.since = datetime.datetime.strptime(args.since, "%Y-%m-%d").date()
@@ -308,6 +327,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     asset_prefix = beancount_options['name_assets']
+    liability_prefix = beancount_options['name_liabilities']
     expense_prefix = beancount_options['name_expenses']
     income_prefix = beancount_options['name_income']
 
@@ -322,7 +342,7 @@ if __name__ == '__main__':
     else:
         fetcher = get_ynab_data
 
-    budget, ynab_accounts, ynab_category_groups, ynab_categories, ynab_transactions = fetcher(args.ynab_token, args.budget, args.since)
+    budget, ynab_accounts, ynab_category_groups, ynab_categories, ynab_transactions = fetcher(args.ynab_token, args.budget, args.since, args.account_id)
 
     if args.list_ynab_ids:
         list_ynab_ids(account_mapping, ynab_accounts, ynab_category_groups, ynab_categories)
@@ -352,8 +372,10 @@ if __name__ == '__main__':
     inflows_category_id = r[0]
 
     def to_bean(id):
-        if id in ynab_accounts:
+        if id in ynab_accounts and ynab_accounts[id].type in ['checking', 'savings', 'otherAsset', 'cash']:
             bean_default = f'{asset_prefix}:{ynab_accounts[id].name}'
+        elif id in ynab_accounts and ynab_accounts[id].type in ['creditCard', 'lineOfCredit', 'otherLiability']:
+            bean_default = f'{liability_prefix}:{ynab_accounts[id].name}'
         elif id == inflows_category_id:
             # special case for the inflows category id
             bean_default = f'{income_prefix}:{fmt_ynab_category(id, ynab_category_groups, ynab_categories)}'
